@@ -8,11 +8,11 @@ WORKDIR /app
 COPY . .
 
 # Build the Go application
-RUN go build -o sync-app
+RUN go build -o gdrivesync
 
 # Entry point command to run the application with environment variables
-CMD ["./sync-app"]
+CMD ["./gdrivesync"]
 
 # Example usage:
-# docker build -t sync-app .
+# docker build -t gdrivesync .
 # docker run -e SYNC_PATH=/default/sync/path -e API_KEY=your_api_key -v /local/sync/path:/default/sync/path sync-app
