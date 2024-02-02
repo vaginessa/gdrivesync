@@ -2,130 +2,255 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sync"
 
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
 )
 
-func main() {
-	// Load API key from environment variable
-	apiKey := os.Getenv("API_KEY")
-	if apiKey == "" {
-		log.Fatal("API_KEY environment variable not set")
-	}
+const (
+	tokenFile       = "token.json"
+	localFolderPath = "C:\\testsync\\"
+	gDriveFolderID  = "folder_identifier"
+)
 
-	// Obtain a Drive service client using the API key
-	client, err := drive.NewService(context.Background(), option.WithAPIKey(apiKey))
-	if err != nil {
-		log.Fatalf("Unable to create Drive service client: %v", err)
-	}
-
-	// Sync the specified local directory to Google Drive
-	if err := syncToDrive(client, os.Getenv("SYNC_PATH")); err != nil {
-		log.Fatalf("Error syncing to Google Drive: %v", err)
-	}
-
-	fmt.Println("Sync completed successfully.")
+// File represents a local file
+type File struct {
+	Name string
+	Path string
 }
 
-// Syncs the specified local directory to Google Drive
-func syncToDrive(client *drive.Service, localDirectory string) error {
-	// Retrieve existing files in Google Drive.
-	driveFiles, err := listDriveFiles(client)
+// uploadToGoogleDrive uploads a local file to Google Drive.
+func uploadToGoogleDrive(service *drive.Service, localFilePath, parentFolderID string) error {
+	file, err := os.Open(localFilePath)
 	if err != nil {
-		return fmt.Errorf("Error listing Drive files: %v", err)
+		return err
+	}
+	defer file.Close()
+
+	fileName := filepath.Base(localFilePath)
+
+	// Check if the file already exists on Google Drive
+	if existingFileID := getDriveFileID(service, fileName, parentFolderID); existingFileID != "" {
+		fmt.Printf("Updating %s on Google Drive...\n", fileName)
+
+		_, err := service.Files.Update(existingFileID, nil).Media(file).Do()
+		return err
 	}
 
-	// Walk through the local directory and upload or update files in Google Drive.
-	err = filepath.Walk(localDirectory, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+	// File doesn't exist, create a new file
+	fmt.Printf("Uploading %s to Google Drive...\n", fileName)
+	driveFile := &drive.File{
+		Name:     fileName,
+		Parents:  []string{parentFolderID},
+		MimeType: "application/octet-stream",
+	}
 
-		if !info.IsDir() {
-			fileName := filepath.Base(path)
-			driveFile, exists := findDriveFile(driveFiles, fileName)
+	_, err = service.Files.Create(driveFile).Media(file).Do()
+	return err
+}
 
-			if exists {
-				// File exists in Google Drive, update it if changes were made.
-				err := updateDriveFile(client, path, driveFile)
-				if err != nil {
-					log.Printf("Error updating file %s: %v", path, err)
-				}
-			} else {
-				// File doesn't exist in Google Drive, upload it.
-				err := uploadFile(client, path)
-				if err != nil {
-					log.Printf("Error uploading file %s: %v", path, err)
-				}
-			}
-		}
+// getDriveFileID retrieves the ID of an existing file on Google Drive.
+func getDriveFileID(service *drive.Service, fileName, parentFolderID string) string {
+	query := fmt.Sprintf("name='%s' and '%s' in parents and trashed=false", fileName, parentFolderID)
+	files, err := service.Files.List().Q(query).Do()
+	if err != nil {
+		log.Printf("Error checking if file exists: %v\n", err)
+		return ""
+	}
 
-		return nil
+	if len(files.Files) > 0 {
+		return files.Files[0].Id
+	}
+
+	return ""
+}
+
+// getTokenFromWeb uses Config to request a Token. It returns the retrieved Token.
+func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
+	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+	fmt.Printf("Go to the following link in your browser then type the "+
+		"authorization code: \n%v\n", authURL)
+
+	// Start a local server to receive the authorization code
+	authCodeCh := make(chan string)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		code := r.URL.Query().Get("code")
+		authCodeCh <- code
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("Authorization code received. You can now close this window."))
 	})
 
+	go func() {
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	// Open the user's default web browser
+	openBrowser(authURL)
+
+	// Wait for the authorization code
+	code := <-authCodeCh
+
+	tok, err := config.Exchange(context.Background(), code)
 	if err != nil {
-		return fmt.Errorf("Error walking local directory: %v", err)
+		log.Fatalf("Unable to exchange code for token: %v", err)
 	}
 
-	return nil
+	return tok, nil
 }
 
-// Lists files in the user's Google Drive
-func listDriveFiles(srv *drive.Service) ([]*drive.File, error) {
-	files, err := srv.Files.List().Do()
+// getClient uses a Context and Config to retrieve a Token then generate a Client. It returns the generated client.
+func getClient(config *oauth2.Config) *http.Client {
+	tok, err := tokenFromFile()
+	if err != nil {
+		tok, err = getTokenFromWeb(config)
+		if err != nil {
+			log.Fatalf("Unable to retrieve token from web: %v", err)
+		}
+		saveToken(tok)
+	}
+	return config.Client(context.Background(), tok)
+}
+
+// tokenFromFile retrieves a Token from a local file.
+func tokenFromFile() (*oauth2.Token, error) {
+	file, err := os.ReadFile(tokenFile)
 	if err != nil {
 		return nil, err
 	}
-	return files.Files, nil
+	tok := &oauth2.Token{}
+	err = json.Unmarshal(file, tok)
+	return tok, err
 }
 
-// Helper function to find a file in the list of Google Drive files
-func findDriveFile(driveFiles []*drive.File, fileName string) (*drive.File, bool) {
-	for _, driveFile := range driveFiles {
-		if driveFile.Name == fileName {
-			return driveFile, true
+// saveToken saves a token to a local file.
+func saveToken(token *oauth2.Token) {
+	data, err := json.Marshal(token)
+	if err != nil {
+		log.Fatalf("Unable to marshal token: %v", err)
+	}
+	err = os.WriteFile(tokenFile, data, 0644)
+	if err != nil {
+		log.Fatalf("Unable to write token file: %v", err)
+	}
+}
+
+// openBrowser opens the default web browser to the specified URL.
+func openBrowser(url string) error {
+	var err error
+	switch runtime.GOOS {
+	case "linux":
+		err = exec.Command("xdg-open", url).Start()
+	case "windows":
+		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		err = exec.Command("open", url).Start()
+	default:
+		err = fmt.Errorf("unsupported platform")
+	}
+	return err
+}
+
+// listLocalFiles returns a list of files in the specified local folder.
+func listLocalFiles(folderPath string) ([]File, error) {
+	var files []File
+	err := filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
-	}
-	return nil, false
+		if !info.IsDir() {
+			relPath, err := filepath.Rel(folderPath, path)
+			if err != nil {
+				return err
+			}
+			files = append(files, File{Name: relPath, Path: path})
+		}
+		return nil
+	})
+	return files, err
 }
 
-// Helper function to update a file in Google Drive
-func updateDriveFile(client *drive.Service, localFilePath string, driveFile *drive.File) error {
-	file, err := os.Open(localFilePath)
+// syncFolder uploads new or modified local files to Google Drive.
+func syncFolder(service *drive.Service, localFolderPath, parentFolderID string) error {
+	localFiles, err := listLocalFiles(localFolderPath)
 	if err != nil {
-		return fmt.Errorf("Error opening file %s: %v", localFilePath, err)
-	}
-	defer file.Close()
-
-	// Update the content of the existing file in Google Drive
-	_, err = client.Files.Update(driveFile.Id, &drive.File{}).Media(file).Do()
-	if err != nil {
-		return fmt.Errorf("Error updating file %s in Google Drive: %v", localFilePath, err)
+		return err
 	}
 
-	fmt.Printf("Updated file: %s\n", localFilePath)
+	var wg sync.WaitGroup
+	for _, localFile := range localFiles {
+		wg.Add(1)
+		go func(file File) {
+			defer wg.Done()
+
+			// Upload the file to Google Drive (with overwrite)
+			err := uploadToGoogleDrive(service, file.Path, parentFolderID)
+			if err != nil {
+				log.Printf("Error syncing %s: %v\n", file.Name, err)
+			}
+		}(localFile)
+	}
+
+	wg.Wait()
+
 	return nil
 }
 
-// Helper function to upload a file to Google Drive
-func uploadFile(client *drive.Service, localFilePath string) error {
-	file, err := os.Open(localFilePath)
+// fileExistsOnDrive checks if a file with the given name exists in the specified Google Drive folder.
+func fileExistsOnDrive(service *drive.Service, fileName, parentFolderID string) bool {
+	query := fmt.Sprintf("name='%s' and '%s' in parents and trashed=false", fileName, parentFolderID)
+	files, err := service.Files.List().Q(query).Do()
 	if err != nil {
-		return fmt.Errorf("Error opening file %s: %v", localFilePath, err)
+		log.Printf("Error checking if file exists: %v\n", err)
+		return false
 	}
-	defer file.Close()
+	return len(files.Files) > 0
+}
 
-	// Upload the file to Google Drive
-	_, err = client.Files.Create(&drive.File{Name: filepath.Base(localFilePath)}).Media(file).Do()
+func main() {
+	// Retrieve OAuth configuration from environment variables
+	clientID := os.Getenv("CLIENT_ID")
+	clientSecret := os.Getenv("CLIENT_SECRET")
+
+	if clientID == "" || clientSecret == "" {
+		log.Fatal("Missing CLIENT_ID or CLIENT_SECRET environment variables")
+	}
+
+	config := &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		RedirectURL:  "http://localhost:8080", // Use local server for redirect URI
+		Scopes: []string{
+			"https://www.googleapis.com/auth/drive.file", // Adjust scope as needed
+		},
+		Endpoint: google.Endpoint,
+	}
+
+	client := getClient(config)
+
+	// Use the client to interact with the Google Drive API
+	service, err := drive.NewService(context.Background(), option.WithHTTPClient(client))
 	if err != nil {
-		return fmt.Errorf("Error uploading file %s to Google Drive: %v", localFilePath, err)
+		log.Fatalf("Unable to create Drive service: %v", err)
 	}
 
-	fmt.Printf("Uploaded file: %s\n", localFilePath)
-	return nil
+	// Example: Sync local folder with Google Drive
+	err = syncFolder(service, localFolderPath, gDriveFolderID)
+	if err != nil {
+		log.Fatalf("Error syncing folder: %v", err)
+	}
+
+	fmt.Println("Sync complete.")
 }
